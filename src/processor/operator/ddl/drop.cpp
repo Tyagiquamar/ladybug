@@ -4,6 +4,7 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
+#include "catalog/catalog_entry/sequence_catalog_entry.h"
 #include "common/exception/binder.h"
 #include "common/string_utils.h"
 #include "main/client_context.h"
@@ -45,6 +46,26 @@ void Drop::executeInternal(ExecutionContext* context) {
     }
 }
 
+// A SERIAL column is backed by an implicit sequence named <table>_<column>_serial, which is
+// created with the table and removed by Catalog::dropSerialSequence when the table goes. The
+// name is the only link back, so recover the owner from the catalog to name it in the error.
+static std::pair<std::string, std::string> findSerialSequenceOwner(Catalog* catalog,
+    transaction::Transaction* transaction, const std::string& sequenceName) {
+    for (auto* entry : catalog->getTableEntries(transaction)) {
+        for (auto& definition : entry->getProperties()) {
+            if (definition.getType().getLogicalTypeID() != LogicalTypeID::SERIAL) {
+                continue;
+            }
+            if (StringUtils::caseInsensitiveEquals(
+                    SequenceCatalogEntry::getSerialName(entry->getName(), definition.getName()),
+                    sequenceName)) {
+                return {entry->getName(), definition.getName()};
+            }
+        }
+    }
+    return {};
+}
+
 void Drop::dropSequence(const main::ClientContext* context) {
     auto catalog = Catalog::Get(*context);
     auto transaction = transaction::Transaction::Get(*context);
@@ -62,6 +83,22 @@ void Drop::dropSequence(const main::ClientContext* context) {
         default:
             UNREACHABLE_CODE;
         }
+    }
+    // A SERIAL sequence has no catalog entry of its own that the user asked to drop: it is part
+    // of the column. Dropping it anyway succeeds and leaves the column referring to a sequence
+    // that is gone, so every later insert into the table and the table's own DROP TABLE fail on
+    // the lookup, and the table can be neither written nor removed. Refuse it the way dropping a
+    // partition child is refused in dropTable below.
+    if (catalog->getSequenceEntry(transaction, dropInfo.name)->hasParent()) {
+        auto owner = findSerialSequenceOwner(catalog, transaction, dropInfo.name);
+        auto ownerMessage = std::string("a SERIAL column");
+        if (!owner.first.empty()) {
+            ownerMessage = std::format("SERIAL column {} of table {}", owner.second, owner.first);
+        }
+        throw BinderException(std::format(
+            "Cannot drop sequence {} because it belongs to {}. The sequence is dropped together "
+            "with the table.",
+            dropInfo.name, ownerMessage));
     }
     catalog->dropSequence(transaction, dropInfo.name);
     appendMessage(std::format("Sequence {} has been dropped.", dropInfo.name), memoryManager);
